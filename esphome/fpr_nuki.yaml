@@ -1,0 +1,274 @@
+# esphome/fpr_nuki.yaml
+# ESPHome firmware: ESP32 WROOM + Grow R503
+# Behavior:
+#  - short press -> doorbell event (no unlock)
+#  - long press -> enable scan-window -> matched fingerprint during window sends unlock request to HA
+#
+# IMPORTANT: edit placeholders (YOUR_WIFI_*, YOUR_OTA_PASSWORD, tag_map mapping)
+
+substitutions:
+  device_name: fpr_nuki
+  friendly_name: "Fingerprint Door"
+  # map: finger_id:name  (edit to your users)
+  tag_map: |
+    0:alice
+    1:bob
+    2:guest
+
+esphome:
+  name: ${device_name}
+  platform: ESP32
+  board: esp32dev
+
+logger:
+  level: INFO
+
+# Home Assistant API (optional encryption)
+api:
+  encryption:
+    key: ""  # optional: paste a 32-char key or use !secret api_key
+
+ota:
+  password: ""  # optional: use !secret ota_password
+
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASS"
+  ap:
+    ssid: "${device_name} Fallback"
+    password: "fallback_password"
+
+# ---------------- UART (hardware) ----------------
+uart:
+  id: uart_fpr
+  rx_pin: GPIO16   # sensor TX -> ESP32 RX (change if needed)
+  tx_pin: GPIO17   # sensor RX -> ESP32 TX (change if needed)
+  baud_rate: 57600
+  debug: false
+
+# ---------------- Globals for scan-mode ----------------
+globals:
+  - id: scan_mode_enabled
+    type: bool
+    initial_value: 'false'
+  - id: scan_mode_expires_at
+    type: long
+    initial_value: '0'
+  - id: last_finger_id
+    type: int
+    initial_value: '-1'
+
+# ---------------- Fingerprint sensor (Grow R503) ----------------
+fingerprint_grow:
+  id: fpr
+  uart_id: uart_fpr
+
+  # optional wake/sensing pin from module (wire if available)
+  sensing_pin: GPIO5
+
+  # optional sensor power control (if module exposes 3.3VT)
+  # sensor_power_pin:
+  #   number: GPIO4
+  #   inverted: true
+
+  idle_period_to_sleep: 8s
+
+  on_finger_scan_matched:
+    then:
+      - lambda: |-
+          int fid = finger_id;
+          int conf = confidence;
+          id(last_finger_id) = fid;
+          ESP_LOGI("fpr", "Matched ID %d (conf %d)", fid, conf);
+
+          // map id->name
+          std::string tagmap = R"(${tag_map})";
+          std::string user = "user_" + std::to_string(fid);
+          std::istringstream ss(tagmap);
+          std::string line;
+          while (std::getline(ss, line)) {
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string sid = line.substr(0, colon);
+            std::string sname = line.substr(colon + 1);
+            auto trim = [](std::string &s) {
+              while (!s.empty() && isspace((unsigned char)s.front())) s.erase(s.begin());
+              while (!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+            };
+            trim(sid); trim(sname);
+            if (sid == std::to_string(fid)) { user = sname; break; }
+          }
+
+          // 1) announce a tag scanned (friendly) in HA
+          id(fpr).publish_homeassistant_tag_scanned(user.c_str());
+
+          // 2) LED success
+          id(fpr).aura_led_control({
+            .state = fingerprint_grow::AURA_STATE::BREATHING,
+            .color = fingerprint_grow::AURA_COLOR::GREEN,
+            .speed = 80,
+            .count = 2
+          });
+
+          // 3) if scan-mode is active and hasn't expired, ask HA to unlock (publish event)
+          unsigned long now = millis();
+          if (id(scan_mode_enabled) && now < id(scan_mode_expires_at)) {
+            // use homeassistant.event action via publish_homeassistant_event
+            std::string payload = "{\"user\":\"" + user + "\",\"finger_id\":" + std::to_string(fid) + ",\"confidence\":" + std::to_string(conf) + "}";
+            id(fpr).publish_homeassistant_event("fpr_unlock_request", payload.c_str());
+          }
+  on_finger_scan_unmatched:
+    then:
+      - lambda: |-
+          ESP_LOGW("fpr", "No match");
+      - fingerprint_grow.aura_led_control:
+          state: FLASHING
+          color: RED
+          speed: 60
+          count: 2
+
+  on_enrollment_scan:
+    then:
+      - fingerprint_grow.aura_led_control:
+          state: FLASHING
+          color: BLUE
+          speed: 100
+          count: 1
+
+  on_enrollment_done:
+    then:
+      - fingerprint_grow.aura_led_control:
+          state: BREATHING
+          color: GREEN
+          speed: 100
+          count: 2
+
+  on_enrollment_failed:
+    then:
+      - fingerprint_grow.aura_led_control:
+          state: FLASHING
+          color: RED
+          speed: 60
+          count: 3
+
+# ---------------- Sensors exposed to HA ----------------
+sensor:
+  - platform: fingerprint_grow
+    fingerprint_count:
+      name: "FPR Template Count"
+    last_finger_id:
+      name: "FPR Last Finger ID"
+    last_confidence:
+      name: "FPR Last Confidence"
+    status:
+      name: "FPR Status"
+    capacity:
+      name: "FPR Capacity"
+    security_level:
+      name: "FPR Security Level"
+
+text_sensor:
+  - platform: template
+    name: "FPR Last User"
+    lambda: |-
+      int idv = id(last_finger_id);
+      if (idv < 0) return {"-"};
+      std::string tagmap = R"(${tag_map})";
+      std::istringstream ss(tagmap);
+      std::string line;
+      while (std::getline(ss, line)) {
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string sid = line.substr(0, colon);
+        std::string sname = line.substr(colon + 1);
+        auto trim = [](std::string &s) {
+          while (!s.empty() && isspace((unsigned char)s.front())) s.erase(s.begin());
+          while (!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+        };
+        trim(sid); trim(sname);
+        if (sid == std::to_string(idv)) return {sname};
+      }
+      return {"unknown"};
+
+# ---------------- Doorbell button (short / long) ----------------
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO13
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "FPR Button"
+    id: fpr_button
+    on_press:
+      then:
+        - delay: 700ms
+        - if:
+            condition:
+              binary_sensor.is_on: fpr_button
+            then:
+              # LONG press: enable scan window (10s)
+              - lambda: |-
+                  id(scan_mode_enabled) = true;
+                  id(scan_mode_expires_at) = millis() + 10000; // 10s
+                  ESP_LOGI("button", "Long press — scan-mode enabled 10s");
+              - logger.log: "Scan-mode enabled: place finger to unlock."
+            else:
+              # SHORT press: doorbell event
+              - homeassistant.event:
+                  event: doorbell_pressed
+                  data:
+                    source: "fpr_button"
+                    message: "short_press"
+
+# ---------------- Enroll/Delete switches (examples) ----------------
+switch:
+  - platform: template
+    name: "Enroll finger 0 (Alice)"
+    optimistic: true
+    turn_on_action:
+      - logger.log: "Starting enrollment for finger 0"
+      - fingerprint_grow.enroll:
+          finger_id: 0
+          num_scans: 3
+
+  - platform: template
+    name: "Delete finger 0 (Alice)"
+    optimistic: true
+    turn_on_action:
+      - logger.log: "Deleting finger 0"
+      - fingerprint_grow.delete:
+          finger_id: 0
+
+  # Add more enroll/delete switches for other finger IDs.
+
+# ---------------- Loading animation (manual control) ----------------
+switch:
+  - platform: template
+    name: "FPR Loading Animation"
+    turn_on_action:
+      - lambda: |-
+          id(fpr).aura_led_control({
+            .state = fingerprint_grow::AURA_STATE::BREATHING,
+            .color = fingerprint_grow::AURA_COLOR::PURPLE,
+            .speed = 120,
+            .count = 0
+          });
+    turn_off_action:
+      - lambda: |-
+          id(fpr).aura_led_control({
+            .state = fingerprint_grow::AURA_STATE::OFF,
+            .color = fingerprint_grow::AURA_COLOR::OFF,
+            .speed = 0,
+            .count = 0
+          });
+
+# Optional: external NeoPixel fallback (uncomment & wire if your ring fails)
+# light:
+#   - platform: neopixel
+#     type: GRB
+#     pin: GPIO14
+#     num_leds: 12
+#     id: ext_ring
+#     name: "External LED Ring"
+#
+# then use light.turn_on/off from automations to mirror aura states.

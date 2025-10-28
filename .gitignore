@@ -1,0 +1,16 @@
+# ESPHome build and uploads
+.esphome/
+*.bin
+*.yaml.tmp
+*.yaml.upload.*
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Secrets
+secrets.yaml
+.secrets.yaml

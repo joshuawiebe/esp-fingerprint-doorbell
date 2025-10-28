@@ -1,0 +1,56 @@
+# home_assistant/automations.yaml
+# Example automations: doorbell and unlock-on-scan
+# Replace lock.front_door_nuki3pro with your real lock entity_id
+
+# 1) Unlock on fingerprint scan request (published by ESPHome when long-press + match)
+- id: fpr_unlock_request
+  alias: "FPR: Unlock on fingerprint request"
+  trigger:
+    - platform: event
+      event_type: fpr_unlock_request
+  condition:
+    - condition: template
+      value_template: >
+        {% set u = (trigger.event.data.user if trigger.event.data.user is defined else '') %}
+        {% if u == '' or u == 'guest' %}
+          false
+        {% else %}
+          true
+        {% endif %}
+  action:
+    - service: lock.unlock
+      target:
+        entity_id: lock.front_door_nuki3pro   # <<-- replace this
+    - service: persistent_notification.create
+      data:
+        title: "Fingerprint Unlock"
+        message: "{{ trigger.event.data.user | default('unknown') }} requested unlock."
+
+# 2) Doorbell short press (ESPHome publishes doorbell_pressed)
+- id: fpr_doorbell
+  alias: "FPR: Doorbell short press"
+  trigger:
+    - platform: event
+      event_type: doorbell_pressed
+      event_data:
+        source: "fpr_button"
+  action:
+    - service: script.play_doorbell_sound    # replace with your doorbell script or media player
+      data: {}
+    - service: notify.mobile_app_yourphone
+      data:
+        message: "Doorbell pressed at front door"
+
+# 3) Optional: log all fingerprint-related events for audit
+- id: fpr_event_log
+  alias: "FPR: Event log"
+  trigger:
+    - platform: event
+      event_type: fpr_unlock_request
+    - platform: event
+      event_type: doorbell_pressed
+  action:
+    - service: logbook.log
+      data:
+        name: "Fingerprint"
+        message: "Event: {{ trigger.event.event_type }} data: {{ trigger.event.data }}"
